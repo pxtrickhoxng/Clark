@@ -5,7 +5,22 @@ const FormData = require('form-data');
 const logger = require('../../util/logger');
 const fs = require('fs');
 const path = require('path');
+const { MetricsHandler, register } = require('../../util/metrics.js');
+const { cleanUpChunks, cleanUpExpiredChunks, recordPrintingFolderSize } = require('../util/Printer.js');
 
+const {
+  decodeToken,
+  checkIfTokenSent,
+} = require('../util/token-functions.js');
+const {
+  OK,
+  UNAUTHORIZED,
+  NOT_FOUND,
+  SERVER_ERROR,
+} = require('../../util/constants').STATUS_CODES;
+const {
+  PRINTING = {}
+} = require('../../config/config.json');
 const { decodeToken, checkIfTokenSent } = require('../util/token-functions.js');
 const { OK, UNAUTHORIZED, NOT_FOUND, SERVER_ERROR } =
   require('../../util/constants').STATUS_CODES;
@@ -32,6 +47,17 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
+const FIVE_MINUTES_MS = 300000;
+const TEN_SECONDS_MS = 10000;
+
+if (PRINTING.ENABLED) {
+  setInterval(() => {
+    const dir = path.join(__dirname, 'printing');
+    cleanUpExpiredChunks(dir, FIVE_MINUTES_MS);
+    recordPrintingFolderSize(dir);
+  }, TEN_SECONDS_MS);
+}
+
 router.get('/healthCheck', async (req, res) => {
   /*
    * How these work with Quasar:
@@ -55,7 +81,7 @@ router.get('/healthCheck', async (req, res) => {
     });
 });
 
-router.post('/sendPrintRequest', upload.single('file'), async (req, res) => {
+router.post('/sendPrintRequest', upload.single('chunk'), async (req, res) => {
   if (!checkIfTokenSent(req)) {
     logger.warn('/sendPrintRequest was requested without a token');
     return res.sendStatus(UNAUTHORIZED);
@@ -66,24 +92,40 @@ router.post('/sendPrintRequest', upload.single('file'), async (req, res) => {
     return res.sendStatus(UNAUTHORIZED);
   }
   if (!PRINTING.ENABLED) {
-    logger.warn(
-      'Printing is disabled, returning 200 to mock the printing server'
-    );
+    logger.warn('Printing is disabled, returning 200 to mock the printing server');
     return res.sendStatus(OK);
   }
-  const { copies, sides } = req.body;
-  const file = req.file;
+
+  const { copies, sides, id } = req.body;
+
+  const chunks = await fs.promises.readdir(dir);
+  const assembledPdfFromChunks = path.join(dir, id + '.pdf');
+
+  for (let chunk of chunks) {
+    if (path.extname(chunk) !== '.CHUNK') continue;
+    if (!path.basename(chunk).includes(id)) continue;
+
+    try {
+      const chunkData = await fs.promises.readFile(path.join(dir, chunk));
+      fs.appendFileSync(assembledPdfFromChunks, chunkData);
+    } catch (err) {
+      logger.error('/sendPrintRequest encountered an error while assembling pdf: ' + err);
+      await cleanUpChunks(dir, id);
+      return res.sendStatus(SERVER_ERROR);
+    }
+  }
+
+  const stream = await fs.createReadStream(assembledPdfFromChunks);
   const data = new FormData();
-  data.append('file', fs.createReadStream(file.path), {
-    filename: file.originalname,
-  });
+  data.append('file', fs.createReadStream(file.path), { filename: file.originalname });
   data.append('copies', copies);
   data.append('sides', sides);
-  axios
-    .post(PRINTER_URL + '/print', data, {
+  axios.post(PRINTER_URL + '/print',
+    data,
+    {
       headers: {
         ...data.getHeaders(),
-      },
+      }
     })
     .then(() => {
       // delete file from temp folder after printing
@@ -93,19 +135,7 @@ router.post('/sendPrintRequest', upload.single('file'), async (req, res) => {
         }
       });
       res.sendStatus(OK);
-    })
-    .then(() => {
-      // create an audit log for user print
-      AuditLog.Create({
-        userId: user._id,
-        action: AuditLogActions.PRINT_PAGE,
-        details: {
-          fileSize: file.size,
-          copies: copies,
-        },
-      }).catch(logger.error);
-    })
-    .catch((err) => {
+    }).catch((err) => {
       logger.error('/sendPrintRequest had an error: ', err);
       res.sendStatus(SERVER_ERROR);
     });
