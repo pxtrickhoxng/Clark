@@ -21,11 +21,6 @@ const {
 const {
   PRINTING = {}
 } = require('../../config/config.json');
-const { decodeToken, checkIfTokenSent } = require('../util/token-functions.js');
-const { OK, UNAUTHORIZED, NOT_FOUND, SERVER_ERROR } =
-  require('../../util/constants').STATUS_CODES;
-const { PRINTING = {} } = require('../../config/config.json');
-const { MetricsHandler } = require('../../util/metrics');
 const AuditLogActions = require('../util/auditLogActions.js');
 const AuditLog = require('../models/AuditLog.js');
 
@@ -82,6 +77,8 @@ router.get('/healthCheck', async (req, res) => {
 });
 
 router.post('/sendPrintRequest', upload.single('chunk'), async (req, res) => {
+  let totalFileSize = 0;
+
   if (!checkIfTokenSent(req)) {
     logger.warn('/sendPrintRequest was requested without a token');
     return res.sendStatus(UNAUTHORIZED);
@@ -107,6 +104,7 @@ router.post('/sendPrintRequest', upload.single('chunk'), async (req, res) => {
 
     try {
       const chunkData = await fs.promises.readFile(path.join(dir, chunk));
+      totalFileSize += chunkData.length;
       fs.appendFileSync(assembledPdfFromChunks, chunkData);
     } catch (err) {
       logger.error('/sendPrintRequest encountered an error while assembling pdf: ' + err);
@@ -127,7 +125,22 @@ router.post('/sendPrintRequest', upload.single('chunk'), async (req, res) => {
         ...data.getHeaders(),
       }
     })
-    .then(() => {
+    .then( async () => {
+
+      //create audit log on print
+      await AuditLog.create({
+        userId: user._id,
+        action: AuditLogActions.PRINT_PAGE,
+        details: {
+          copies: parseInt(copies),
+          sides: sides,
+          fileSize: totalFileSize,
+          userEmail: user.email,
+          printedAt: new Date(),
+          printJobId: id
+        }
+      }).catch(logger.error)
+      
       // delete file from temp folder after printing
       fs.unlink(file.path, (err) => {
         if (err) {
